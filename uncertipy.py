@@ -7,29 +7,34 @@ import ssl
 
 import uncertipy.util, uncertipy.connection
 
-def handle_connections(downstream_socket, method, cert_file, key_file):
+def handle_connections(downstream_socket, method, cert_file, key_file, proxy=None):
     insecure_data = b""
     count = 0
     try:
-        uncertipy_connection = uncertipy.connection.UncertipyConnection(downstream_socket, logger)
+        uncertipy_connection = uncertipy.connection.UncertipyConnection(downstream_socket, proxy, logger)
         connection = uncertipy.connection.Connection(uncertipy_connection.downstream_socket, logger)
-        logger.debug(f'Got connection from {connection.to_str()}')
+        logger.info(f'Got connection from {connection.to_str()}')
 
         interception = uncertipy.connection.generate_interception(connection, method, cert_file, key_file, logger)
-        logger.debug(f'Intercepted connection to {interception.hostname}')
+        logger.info(f'Intercepted connection to {interception.hostname}')
 
         try:
-            if not connection.upstream_port in uncertipy.util.CLEARTEXT_PORTS:
-                uncertipy_connection.wrap_downstream(interception.context)
+            uncertipy_connection.wrap_downstream(interception.context)
+            if uncertipy_connection.downstream_socket.fileno() == -1:
+                logger.critical(f'Socket fileno: {uncertipy_connection.downstream_socket.fileno()}')
+                logger.error(f'{connection.to_str()} socket closed. Exiting.')
+                return
 
         except (ssl.SSLError, ConnectionResetError, BrokenPipeError, TimeoutError) as e:
             logger.error(f"{connection.client_ip}: {connection.upstream_str} {e}")
             return
 
         uncertipy_connection.set_upstream(connection.upstream_ip, connection.upstream_port)
-        if uncertipy_connection.upstream_socket and not connection.upstream_port in uncertipy.util.CLEARTEXT_PORTS:
+        if uncertipy_connection.upstream_socket:
             try:
                 uncertipy_connection.wrap_upstream(connection.upstream_sni)
+                uncertipy_connection.send_proxy_connect()
+
             except (ssl.SSLZeroReturnError, TimeoutError):
                 logger.debug("Cannot wrap upstream socket. Destroying also the TCP socket.")
                 uncertipy_connection.upstream_socket = None
@@ -51,7 +56,7 @@ def handle_connections(downstream_socket, method, cert_file, key_file):
                     logger.debug(f'Socket: {ready_socket}')
                     if ready_socket == uncertipy_connection.downstream_socket:
                         try:
-                            from_client = uncertipy_connection.downstream_socket.recv(4096)
+                            from_client = uncertipy_connection.recv_downstream()
 
                         except TimeoutError:
                             logger.exception(f'{connection.client_ip}: {connection.upstream_sni} timed out')
@@ -71,7 +76,7 @@ def handle_connections(downstream_socket, method, cert_file, key_file):
 
                     elif ready_socket == uncertipy_connection.upstream_socket:
                         try:
-                            from_server = uncertipy_connection.upstream_socket.recv(4096)
+                            from_server = uncertipy_connection.recv_upstream()
 
                         except TimeoutError:
                             count = 1
@@ -118,7 +123,7 @@ if __name__ == '__main__':
     parser.add_argument('-c', '--cert', help='Path to a valid TLS certificate, signed by a CA.', required=True)
     parser.add_argument('-k', '--key', help='Path to the certificate key.', required=True)
     parser.add_argument('-m', '--method', help='TLS interception method to use.', required=True, choices=uncertipy.util.INTERCEPTION_METHODS)
-    #parser.add_argument('-u', '--upstream-proxy', help='Upstream proxy to intercept requests with. Ex: 127.0.0.1:8080', required=False)
+    parser.add_argument('-u', '--upstream-proxy', help='Upstream proxy to intercept requests with. Only works for HTTP/HTTPS. Ex: 127.0.0.1:8080', required=False)
     parser.add_argument('-v', '--verbose', help='Verbose output.', action='store_true')
     parser.add_argument('-d', '--debug', help='Debug output.', action='store_true')
 
@@ -129,7 +134,7 @@ if __name__ == '__main__':
     cert_file = args.cert
     key_file = args.key
     method = args.method
-    #upstream_proxy = args.upstream_proxy
+    upstream_proxy = args.upstream_proxy
 
     logger = uncertipy.util.logger("Log")
 
@@ -154,7 +159,7 @@ if __name__ == '__main__':
             client, addr = listener.accept()
             client.settimeout(30)
             logger.debug(f'Request received from {addr}')
-            _thread.start_new_thread(handle_connections, (client, method, cert_file, key_file))
+            _thread.start_new_thread(handle_connections, (client, method, cert_file, key_file, upstream_proxy))
 
         except Exception as e:
             logger.exception(f'Error while handling request: {e}')

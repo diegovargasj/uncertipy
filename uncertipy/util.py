@@ -17,13 +17,15 @@ INTERCEPTION_METHODS = [
     'real_cert_CA'
 ]
 
-CLEARTEXT_PORTS = [
-    80,
-    8080,
-    8081
-]
+# CLEARTEXT_PORTS = [
+#     80,
+#     8080,
+#     8081
+# ]
 
 GENERATED_CERTS = {}
+
+PROXY_CONNECT = 'CONNECT {}:{} HTTP/1.1\r\n\r\n'
 
 def SNIFromHello(data):
     TLS_HANDSHAKE = 22

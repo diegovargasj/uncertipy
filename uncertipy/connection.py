@@ -17,45 +17,95 @@ connection_counter = counter()
 
 class UncertipyConnection(object):
 
-    def __init__(self, downstream_socket, logger):
+    def __init__(self, downstream_socket, proxy, logger):
         self.logger = logger
         self.downstream_socket = downstream_socket
         self.downstream_socket.settimeout(10)
+        self.upstream_host = None
+        self.upstream_port = None
+        self.proxy = proxy
         self.upstream_socket = None
         self.upstream_context = None
+        self.upstream_tls = False
+        self.downstream_tls = False
         self.downstream_tls_buf = b""
 
-    def set_upstream(self, ip, port):
-        self.logger.debug(f"Connecting to TCP upstream {ip}:{port}")
+    def set_upstream(self, host, port):
+        self.logger.debug(f"Connecting to TCP upstream {host}:{port}")
+        self.upstream_host = host
+        self.upstream_port = port
         self.upstream_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.upstream_socket.settimeout(10)
+        upstream_host = host
+        upstream_port = port
+        if self.proxy:
+            self.logger.debug(f'Using {self.proxy} as proxy')
+            upstream_host, upstream_port = self.proxy.split(':')
+            upstream_port = int(upstream_port)
+
         try:
-            self.upstream_socket.connect((ip, port))
-            self.logger.debug(f"Connected to TCP upstream {ip}:{port}")
+            self.upstream_socket.connect((upstream_host, upstream_port))
+            self.logger.debug(f"Connected to TCP upstream {upstream_host}:{upstream_port}")
+
         except (ConnectionRefusedError, TimeoutError, OSError) as e:
             self.logger.debug(f"Upstream connection failed with {e}")
             self.upstream_socket = None
 
     def wrap_downstream(self, context):
-        self.logger.debug(f"Wrapping downstream with TLS")
-        self.downstream_socket = context.wrap_socket(self.downstream_socket, server_side=True)
-        self.downstream_socket.settimeout(10)
-        self.logger.debug(f"Wrapped downstream with TLS")
+        if not self.proxy:
+            self.logger.debug(f"Wrapping downstream with TLS")
+            self.downstream_socket = context.wrap_socket(self.downstream_socket, server_side=True)
+            self.downstream_socket.settimeout(10)
+            self.downstream_tls = True
+            self.logger.debug(f"Wrapped downstream with TLS")
+
+        else:
+            self.logger.debug(f'Connection is cleartext, not wrapping downstream with TLS')
 
     def wrap_upstream(self, hostname):
-        self.logger.debug(f"Wrapping upstream with TLS")
-        self.upstream_context = uncertipy.util.create_client_context()
-        self.upstream_socket = self.upstream_context.wrap_socket(self.upstream_socket, server_hostname=hostname)
-        self.upstream_socket.settimeout(10)
-        self.logger.debug(f"Wrapped upstream with TLS")
+        if not self.proxy:
+            self.logger.debug(f"Wrapping upstream with TLS")
+            self.upstream_context = uncertipy.util.create_client_context()
+            self.upstream_socket = self.upstream_context.wrap_socket(self.upstream_socket, server_hostname=hostname)
+            self.upstream_socket.settimeout(10)
+            self.upstream_tls = True
+            self.logger.debug(f"Wrapped upstream with TLS")
+
+        else:
+            self.logger.debug(f'Connection is cleartext, not wrapping upstream with TLS')
+
+    def send_proxy_connect(self):
+        if self.proxy:
+            self.logger.debug(f'Sending proxy CONNECT request to {self.proxy}')
+            self.send_upstream(uncertipy.util.PROXY_CONNECT.format(self.upstream_host, self.upstream_port).encode())
+            proxy_response = self.recv_upstream()
+            self.logger.debug(f'Proxy CONNECT response: {proxy_response}')
+
+        else:
+            self.logger.error(f'Proxy not configured')
+
+    def recv_upstream(self, bufsize=4096):
+        return self.upstream_socket.recv(bufsize)
+
+    def send_upstream(self, data):
+        self.upstream_socket.send(data)
+
+    def recv_downstream(self, bufsize=4096):
+        return self.downstream_socket.recv(bufsize)
+
+    def send_downstream(self, data):
+        self.downstream_socket.send(data)
 
     def close(self):
         try:
-            self.downstream_socket.unwrap()
-            self.upstream_socket.unwrap()
+            if self.downstream_tls:
+                self.downstream_socket.unwrap()
 
-        except:
-            pass
+            if self.upstream_tls:
+                self.upstream_socket.unwrap()
+
+        except Exception as e:
+            self.logger.exception(f'Exception while unwrapping TLS sockets: {e}')
 
         self.downstream_socket.close()
         if self.upstream_socket:
@@ -106,9 +156,10 @@ class TLSInterception(object):
 
 def generate_interception(connection, method, cert_file, key_file, logger):
     cert_chain = uncertipy.util.get_server_cert_fullchain(connection.upstream_ip, connection.upstream_port, connection.upstream_sni)
-    if not cert_chain:
+    if not cert_chain and connection.upstream_port:
         logger.info(f'No cert chain for {connection.upstream_sni}, generating one.')
-        cert_chain = uncertipy.util.generate_certificate(cn=connection.upstream_sni)
+        gen_cert, gen_key = uncertipy.util.generate_certificate(cn=connection.upstream_sni)
+        cert_chain = [OpenSSL.crypto.dump_certificate(OpenSSL.crypto.FILETYPE_PEM, gen_cert)]
 
     if connection.upstream_sni in uncertipy.util.GENERATED_CERTS:
         cert_file_path, key_file_path = uncertipy.util.GENERATED_CERTS[connection.upstream_sni]
